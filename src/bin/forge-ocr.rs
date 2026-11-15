@@ -1,7 +1,7 @@
 //! `forge-ocr`: read scanned PDFs and images.
 //!
 //! ```text
-//! forge-ocr [--models DIR] [--cpu] [--json] [--det-side N] [--batch N] FILE...
+//! forge-ocr [--models DIR] [--device auto|tensorrt|cuda|rocm|migraphx|directml|openvino[:GPU|NPU|CPU]|coreml|cpu] [--cpu] [--json] [--det-side N] [--batch N] FILE...
 //! ```
 //! Text goes to stdout, pages separated by form feeds (\f), one printed row per line. With
 //! `--json`, one JSON object per file with every line's text, score and corners. Timings go to
@@ -16,7 +16,7 @@ use forge_ocr::{Config, Engine, Rgb};
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut models = std::env::var_os("FORGE_OCR_MODELS").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("models"));
-    let (mut cpu, mut json, mut det_side, mut batch) = (false, false, None, None);
+    let (mut device, mut json, mut det_side, mut batch): (Option<String>, bool, Option<usize>, Option<usize>) = (None, false, None, None);
     let mut files = Vec::new();
     let mut checks: Vec<String> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
@@ -24,7 +24,9 @@ fn main() -> Result<()> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--models" => models = args.next().map(PathBuf::from).unwrap_or(models),
-            "--cpu" => cpu = true,
+            "--cpu" => device = Some("cpu".into()),
+            // auto (default), tensorrt, cuda, rocm, migraphx, directml, openvino[:GPU|NPU|CPU], coreml, cpu.
+            "--device" => device = args.next(),
             "--trt" => trt = args.next().map(PathBuf::from),
             "--json" => json = true,
             // One <stem>.txt (or .json) per input file in DIR, instead of stdout.
@@ -48,7 +50,9 @@ fn main() -> Result<()> {
         bail!("no input files (forge-ocr --help)");
     }
     let mut cfg = Config::from_dir(&models)?;
-    cfg.gpu = !cpu;
+    if let Some(d) = device.or_else(|| std::env::var("FORGE_OCR_DEVICE").ok()) {
+        cfg.device = d.parse()?;
+    }
     cfg.trt_cache = trt;
     if let Some(s) = det_side {
         cfg.det_side = s;

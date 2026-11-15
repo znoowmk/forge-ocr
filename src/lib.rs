@@ -39,7 +39,8 @@ pub struct Config {
     /// Lines below this mean character probability are dropped.
     pub min_score: f32,
     pub db: DbParams,
-    pub gpu: bool,
+    /// Where the networks run (see [`Device`]).
+    pub device: Device,
     /// Pages prepared and recognised together (bigger = fuller GPU batches).
     pub chunk: usize,
     /// Check-digit rules for digit runs (see [`ctc::fix_check_digits`]); empty = off.
@@ -58,7 +59,7 @@ impl Config {
         let det = pick(&["det.onnx", "ch_PP-OCRv5_det_mobile.onnx"]).ok_or_else(|| anyhow!("no detector model in {}", d.display()))?;
         let rec = pick(&["rec.onnx", "latin_PP-OCRv5_rec_mobile_fp16.onnx", "latin_PP-OCRv5_rec_mobile.onnx"])
             .ok_or_else(|| anyhow!("no recognizer model in {}", d.display()))?;
-        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), gpu: true, chunk: 8, digit_checks: Vec::new(), trt_cache: None })
+        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), device: Device::Auto, chunk: 8, digit_checks: Vec::new(), trt_cache: None })
     }
 }
 
@@ -158,32 +159,144 @@ fn cuda() -> ort::ep::ExecutionProviderDispatch {
     ort::ep::CUDA::default().with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic).build()
 }
 
+/// Where the networks run. ONNX Runtime does the work; each choice is one of its execution
+/// providers, and the ONNX Runtime library in use must include it (the official packages each
+/// carry a different set: `onnxruntime-gpu` has CUDA and TensorRT, `onnxruntime-directml` has
+/// DirectML, `onnxruntime-openvino` has OpenVINO, the ROCm build has ROCm and MIGraphX).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Device {
+    /// The fastest one present, in this order: TensorRT (with `trt_cache`), CUDA (NVIDIA),
+    /// ROCm then MIGraphX (AMD on Linux), DirectML (any GPU on Windows: NVIDIA, AMD, Intel),
+    /// OpenVINO on the CPU (Intel; faster than plain ONNX Runtime there), CoreML (Apple), and
+    /// the CPU at the end.
+    #[default]
+    Auto,
+    TensorRt,
+    Cuda,
+    Rocm,
+    MiGraphX,
+    DirectMl,
+    /// OpenVINO on a device: `GPU`, `NPU`, `CPU` or `AUTO`.
+    OpenVino(String),
+    CoreMl,
+    Cpu,
+}
+
+impl std::str::FromStr for Device {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Device> {
+        let l = s.to_ascii_lowercase();
+        Ok(match l.as_str() {
+            "auto" => Device::Auto,
+            "tensorrt" | "trt" => Device::TensorRt,
+            "cuda" | "nvidia" => Device::Cuda,
+            "rocm" | "amd" => Device::Rocm,
+            "migraphx" => Device::MiGraphX,
+            "directml" | "dml" => Device::DirectMl,
+            "openvino" | "intel" => Device::OpenVino("GPU".into()),
+            "coreml" | "apple" => Device::CoreMl,
+            "cpu" => Device::Cpu,
+            _ => match l.strip_prefix("openvino:") {
+                Some(d) => Device::OpenVino(d.to_ascii_uppercase()),
+                None => return Err(anyhow!("unknown device `{s}`: auto, tensorrt, cuda, rocm, migraphx, directml, openvino[:GPU|NPU|CPU], coreml or cpu")),
+            },
+        })
+    }
+}
+
+fn tensorrt(cache: &Path, profile: Profile) -> Result<ort::ep::ExecutionProviderDispatch> {
+    std::fs::create_dir_all(cache)?;
+    let dir = cache.to_string_lossy().into_owned();
+    Ok(ort::ep::TensorRT::default()
+        .with_fp16(true)
+        .with_engine_cache(true)
+        .with_engine_cache_path(&dir)
+        .with_timing_cache(true)
+        .with_timing_cache_path(&dir)
+        .with_profile_min_shapes(profile.0)
+        .with_profile_opt_shapes(profile.1)
+        .with_profile_max_shapes(profile.2)
+        .build())
+}
+
+/// The execution providers to try for `device`, best first.
+fn providers(cfg: &Config, profile: Profile) -> Result<Vec<ort::ep::ExecutionProviderDispatch>> {
+    let openvino = |dev: &str| ort::ep::OpenVINO::default().with_device_type(dev).with_dynamic_shapes(true).build();
+    Ok(match &cfg.device {
+        Device::Cpu => Vec::new(),
+        Device::TensorRt => {
+            let cache = cfg.trt_cache.clone().unwrap_or_else(|| std::env::temp_dir().join("forge-ocr-trt"));
+            vec![tensorrt(&cache, profile)?.error_on_failure()]
+        }
+        Device::Cuda => vec![cuda().error_on_failure()],
+        Device::Rocm => vec![ort::ep::ROCm::default().build().error_on_failure()],
+        Device::MiGraphX => vec![ort::ep::MIGraphX::default().build().error_on_failure()],
+        Device::DirectMl => vec![ort::ep::DirectML::default().build().error_on_failure()],
+        Device::OpenVino(d) => vec![openvino(d).error_on_failure()],
+        Device::CoreMl => vec![ort::ep::CoreML::default().build().error_on_failure()],
+        Device::Auto => {
+            let mut eps = Vec::new();
+            if let Some(cache) = &cfg.trt_cache {
+                eps.push(tensorrt(cache, profile)?);
+            }
+            eps.push(cuda());
+            eps.push(ort::ep::ROCm::default().build());
+            eps.push(ort::ep::MIGraphX::default().build());
+            if cfg!(windows) {
+                eps.push(ort::ep::DirectML::default().build());
+            }
+            // OpenVINO on the CPU: on an i7-12800HX it reads 1.8 pages/s against 0.8 for plain
+            // ONNX Runtime and 0.4 on the UHD 770 integrated GPU (shapes vary per line, and
+            // each new shape recompiles there). An Intel Arc card is worth `openvino:GPU`.
+            eps.push(openvino("CPU"));
+            if cfg!(target_vendor = "apple") {
+                eps.push(ort::ep::CoreML::default().build());
+            }
+            // Unavailable ones are skipped quietly.
+            eps.into_iter().map(|e| e.fail_silently()).collect()
+        }
+    })
+}
+
+/// Whether the networks will run on the CPU: asked for, or `Auto` with no accelerator in the
+/// ONNX Runtime library at hand.
+fn on_cpu(device: &Device) -> bool {
+    use ort::ep::ExecutionProvider;
+    match device {
+        Device::Cpu => true,
+        Device::Auto => {
+            let has = |r: ort::Result<bool>| r.unwrap_or(false);
+            !(has(ort::ep::CUDA::is_available())
+                || has(ort::ep::ROCm::is_available())
+                || has(ort::ep::MIGraphX::is_available())
+                || has(ort::ep::DirectML::is_available())
+                || has(ort::ep::OpenVINO::is_available())
+                || has(ort::ep::CoreML::is_available()))
+        }
+        _ => false,
+    }
+}
+
+/// Physical cores, roughly: hyper-threads slow ONNX Runtime's CPU kernels down.
+fn cpu_threads() -> usize {
+    let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (logical / 2).max(1)
+}
+
 fn session(env: &ort::environment::Environment, path: &Path, cfg: &Config, profile: Profile) -> Result<Session> {
     let mut b = Session::builder(env).map_err(|e| anyhow!("{e}"))?;
-    if cfg.gpu {
-        let mut eps = Vec::new();
-        if let Some(cache) = &cfg.trt_cache {
-            std::fs::create_dir_all(cache)?;
-            let dir = cache.to_string_lossy().into_owned();
-            eps.push(
-                ort::ep::TensorRT::default()
-                    .with_fp16(true)
-                    .with_engine_cache(true)
-                    .with_engine_cache_path(&dir)
-                    .with_timing_cache(true)
-                    .with_timing_cache_path(&dir)
-                    .with_profile_min_shapes(profile.0)
-                    .with_profile_opt_shapes(profile.1)
-                    .with_profile_max_shapes(profile.2)
-                    .build(),
-            );
-        }
-        eps.push(cuda());
+    if on_cpu(&cfg.device) {
+        b = b.with_intra_threads(cpu_threads()).map_err(|e| anyhow!("{e}"))?;
+    }
+    if matches!(cfg.device, Device::DirectMl | Device::Auto) && cfg!(windows) {
+        // DirectML needs these two off.
+        b = b.with_memory_pattern(false).map_err(|e| anyhow!("{e}"))?.with_parallel_execution(false).map_err(|e| anyhow!("{e}"))?;
+    }
+    let eps = providers(cfg, profile)?;
+    if !eps.is_empty() {
         b = b.with_execution_providers(eps).map_err(|e| anyhow!("{e}"))?;
     }
-    b.commit_from_file(path)
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("loading {}", path.display()))
+    b.commit_from_file(path).map_err(|e| anyhow!("{e}")).with_context(|| format!("loading {}", path.display()))
 }
 
 fn ms(t: Instant) -> f64 {
@@ -192,8 +305,19 @@ fn ms(t: Instant) -> f64 {
 
 impl Engine {
     pub fn new(cfg: Config) -> Result<Engine> {
-        // One ONNX Runtime environment per process. With `gpu`, each session tries TensorRT (when
-        // asked), then CUDA; ONNX Runtime falls back to the CPU when neither is available.
+        // One ONNX Runtime environment per process. Each session tries the providers of
+        // `cfg.device` in order; ONNX Runtime falls back to the CPU for anything they can't run.
+        let mut cfg = cfg;
+        let cpu = on_cpu(&cfg.device);
+        if cpu {
+            // On a CPU: FP16 has no fast kernels (FP32 is faster), and small batches stay in
+            // cache (8 lines run about 2.5x faster per line than 32).
+            let name = cfg.rec_model.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            if let Some(fp32) = name.strip_suffix("_fp16.onnx").map(|stem| cfg.rec_model.with_file_name(format!("{stem}.onnx"))).filter(|p| p.exists()) {
+                cfg.rec_model = fp32;
+            }
+            cfg.rec_batch = cfg.rec_batch.min(8);
+        }
         let env = ort::init().build().map_err(|e| anyhow!("{e}"))?;
         let det = session(&env, &cfg.det_model, &cfg, DET_PROFILE)?;
         let rec = session(&env, &cfg.rec_model, &cfg, REC_PROFILE)?;

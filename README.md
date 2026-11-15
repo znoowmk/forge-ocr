@@ -106,6 +106,43 @@ which this rule does not try to fix.
 The first `--trt` run builds TensorRT engines for your GPU (about 10 minutes). They are cached in
 the folder you give and reused afterwards.
 
+## Any GPU, or none
+
+`--device` (or `FORGE_OCR_DEVICE`) chooses where the networks run. Each choice is an ONNX
+Runtime execution provider, so the ONNX Runtime library you point `ORT_DYLIB_PATH` at must
+include it. The official packages each carry a different set:
+
+| Hardware | `--device` | ONNX Runtime package |
+|---|---|---|
+| NVIDIA | `tensorrt` (fastest, with `--trt CACHE`), `cuda` | `onnxruntime-gpu` (+ `tensorrt-cu13-libs`) |
+| Any GPU on Windows (NVIDIA, AMD, Intel) | `directml` | `onnxruntime-directml` |
+| Intel CPU, Arc GPU or NPU | `openvino:CPU`, `openvino:GPU`, `openvino:NPU` | `onnxruntime-openvino` |
+| AMD on Linux | `rocm`, `migraphx` | ONNX Runtime ROCm build |
+| Apple | `coreml` | `onnxruntime` for macOS |
+| Anything | `cpu` | `onnxruntime` |
+
+The default, `auto`, tries them in that order and skips the ones the library lacks. Asking for
+one by name fails with a clear message when the library doesn't have it.
+
+On the CPU, ForgeOCR switches to the FP32 recognizer (FP16 has no fast CPU kernels), batches
+of 8 lines (they stay in cache: about 2.5 times faster per line than 32) and one thread per
+physical core. INT8 quantization was measured too and is not used: dynamic INT8 ran 6 to 12
+times slower on this recognizer.
+
+Measured with the same text out of every path:
+
+| Machine | Path | Pages/s |
+|---|---|---|
+| RTX 3060 12 GB | `tensorrt` | 6.9 |
+| RTX 3060 12 GB | `cuda` | 3.4 |
+| Ryzen 7 5800X | `cpu`, before / after the CPU settings | 0.2 / 0.9 |
+| i7-12800HX | `cpu` | 0.8 |
+| i7-12800HX | `openvino:CPU` | 1.8 |
+| i7-12800HX, UHD 770 integrated | `openvino:GPU` | 0.4 |
+
+DirectML, ROCm, MIGraphX and CoreML are wired in and compile, but haven't been run on that
+hardware yet. Reports are welcome.
+
 ## As a library
 
 ```rust
@@ -124,6 +161,7 @@ for page in engine.read_pdf("scan.pdf".as_ref())? {
 
 - Overlap the CPU stages with the GPU (the GPU waits while pages are prepared).
 - Prebuilt binaries with ONNX Runtime bundled, and Python bindings.
+- Test runs on AMD (ROCm, DirectML), Intel Arc and Apple hardware.
 - Layout: columns and tables as structure, not only rows.
 - More languages: PP-OCRv5 recognizers exist for other scripts.
 
