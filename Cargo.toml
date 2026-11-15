@@ -25,3 +25,8 @@ codegen-units = 1
 
 [profile.release.package."*"]
 opt-level = 3
+
+[workspace]
+members = [".", "bindings/c"]
+# Own target dir: its cdylib is also named libforge_ocr.so (the Python module must be forge_ocr).
+exclude = ["bindings/python"]

@@ -157,10 +157,64 @@ for page in engine.read_pdf("scan.pdf".as_ref())? {
 }
 ```
 
+### From Python
+
+```bash
+cd bindings/python && maturin build --release && pip install target/wheels/forge_ocr-*.whl
+```
+
+```python
+import forge_ocr, numpy as np
+from PIL import Image
+
+ocr = forge_ocr.Engine("models", device="cuda")       # same devices as --device
+for page in ocr.read_file("scan.pdf"):                # PDF or image file
+    print(page.text())
+page = ocr.read_image(np.asarray(Image.open("photo.png")))  # HxWx3 or HxWx4 uint8, any strides
+for line in page.lines:
+    print(line.score, line.quad, line.text)
+```
+
+`read_images([...])` reads several arrays in one batch. The GIL is released while the networks
+run. `page.json()` is the same JSON as `forge-ocr --json`.
+
+### From C (or anything with a C FFI)
+
+`cargo build --release -p forge-ocr-c` builds `target/release/libforge_ocr.so` (and `.a`); the
+header is `bindings/c/include/forge_ocr.h`.
+
+```c
+ForgeOcr *ocr = forge_ocr_new("models", "cuda");        /* NULL: see forge_ocr_last_error() */
+ForgeOcrResult *r = forge_ocr_read_file(ocr, "scan.pdf");
+for (size_t p = 0; p < forge_ocr_result_pages(r); p++) {
+    char *text = forge_ocr_page_text(r, p);
+    puts(text);
+    forge_ocr_string_free(text);
+}
+forge_ocr_result_free(r);
+forge_ocr_free(ocr);
+```
+
+`forge_ocr_read_pixels` takes RGB/RGBA buffers with any row stride, and the line accessors give
+text, score and corners. `bindings/c/examples/read.c` prints the same JSON as the CLI.
+
+### Tests of the bindings
+
+Both bindings give the CLI's exact output: `bindings/c/examples/read.c` and
+`bindings/python/tests/test_equivalence.py` compare their JSON with `forge-ocr --json` byte for
+byte (images, PDFs, and NumPy arrays as RGB, RGBA and strided views). `read_images` on several
+arrays gives the same text and boxes; scores move in the third decimal because the recognizer pads
+lines of all the pages together. `tests/bench_overhead.py` times Python against the CLI: on the six
+test pages (CPU, i7-12800HX) 1618 vs 1667 ms per page, so the binding adds nothing measurable.
+Under `valgrind`, `examples/read.c` (image, PDF, missing file) and `tests/pixels.c` (RGBA with
+stride, bad arguments, two engines) lose nothing; the only "possibly lost" blocks are the
+thread-local storage of ONNX Runtime's and rayon's worker threads, which live until the process ends.
+
 ## Roadmap
 
 - Overlap the CPU stages with the GPU (the GPU waits while pages are prepared).
-- Prebuilt binaries with ONNX Runtime bundled, and Python bindings.
+- Prebuilt binaries and wheels with ONNX Runtime bundled.
+- Searchable PDF output (`--pdf`), Node bindings and a browser build.
 - Test runs on AMD (ROCm, DirectML), Intel Arc and Apple hardware.
 - Layout: columns and tables as structure, not only rows.
 - More languages: PP-OCRv5 recognizers exist for other scripts.

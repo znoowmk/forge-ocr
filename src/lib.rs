@@ -283,6 +283,17 @@ fn cpu_threads() -> usize {
     (logical / 2).max(1)
 }
 
+/// The process's ONNX Runtime environment. ONNX Runtime allows only one per process, ever (a
+/// second `build()` fails even after the first is dropped), so every [`Engine`] shares this one.
+fn environment() -> Result<ort::environment::Environment> {
+    static ENV: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
+    let mut env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    if env.is_none() {
+        *env = Some(ort::init().build().map_err(|e| anyhow!("{e}"))?);
+    }
+    Ok(env.clone().expect("set above"))
+}
+
 fn session(env: &ort::environment::Environment, path: &Path, cfg: &Config, profile: Profile) -> Result<Session> {
     let mut b = Session::builder(env).map_err(|e| anyhow!("{e}"))?;
     if on_cpu(&cfg.device) {
@@ -318,7 +329,7 @@ impl Engine {
             }
             cfg.rec_batch = cfg.rec_batch.min(8);
         }
-        let env = ort::init().build().map_err(|e| anyhow!("{e}"))?;
+        let env = environment()?;
         let det = session(&env, &cfg.det_model, &cfg, DET_PROFILE)?;
         let rec = session(&env, &cfg.rec_model, &cfg, REC_PROFILE)?;
         let chars = rec.metadata().map_err(|e| anyhow!("{e}"))?.custom("character").ok_or_else(|| anyhow!("the recognizer has no `character` metadata"))?;
@@ -342,6 +353,17 @@ impl Engine {
         tm.pages_rendered += rendered;
         drop(tm);
         self.read_images(imgs)
+    }
+
+    /// Reads a PDF or an image file (any format the `image` crate decodes), choosing by extension.
+    /// Images larger than [`pdf::MAX_SIDE`] are scaled down first, as pages from a PDF are.
+    pub fn read_file(&self, path: &Path) -> Result<Vec<Page>> {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+            self.read_pdf(path)
+        } else {
+            let img = image::open(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+            self.read_images(vec![Rgb::from_image(img).capped(pdf::MAX_SIDE)])
+        }
     }
 
     /// Reads page images, `chunk` at a time.

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use forge_ocr::{Config, Engine, Rgb};
+use forge_ocr::{Config, Engine};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -71,11 +71,7 @@ fn main() -> Result<()> {
     let load = t0.elapsed().as_secs_f64();
     let t = Instant::now();
     for f in &files {
-        let pages = if f.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
-            engine.read_pdf(f)?
-        } else {
-            engine.read_images(vec![Rgb::from_image(image::open(f)?).capped(forge_ocr::pdf::MAX_SIDE)])?
-        };
+        let pages = engine.read_file(f)?;
         let body = if json {
             serde_json::json!({"file": f, "pages": pages}).to_string()
         } else {

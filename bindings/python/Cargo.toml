@@ -1,0 +1,27 @@
+[package]
+name = "forge-ocr-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for ForgeOCR"
+license = "Apache-2.0"
+repository = "https://github.com/znoowmk/forge-ocr"
+publish = false
+
+[lib]
+name = "forge_ocr"
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-ocr = { path = "../.." }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+numpy = "0.27"
+serde_json = "1"
+anyhow = "1"
+
+# Its own workspace and target dir (see the root Cargo.toml).
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

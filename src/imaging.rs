@@ -20,6 +20,25 @@ impl Rgb {
         Rgb { w, h, px: rgb.into_raw() }
     }
 
+    /// From rows of 8-bit RGB (`channels` 3) or RGBA (4, alpha dropped) pixels, `stride` bytes
+    /// apart. `src` must hold `stride * (h - 1) + w * channels` bytes. Used by the C and Python APIs.
+    pub fn from_rows(src: &[u8], w: usize, h: usize, channels: usize, stride: usize) -> Rgb {
+        let row_len = w * channels;
+        if channels == 3 && stride == row_len {
+            return Rgb { w, h, px: src[..w * h * 3].to_vec() };
+        }
+        let mut px = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            let row = &src[y * stride..y * stride + row_len];
+            if channels == 3 {
+                px.extend_from_slice(row);
+            } else {
+                row.chunks_exact(channels).for_each(|p| px.extend_from_slice(&p[..3]));
+            }
+        }
+        Rgb { w, h, px }
+    }
+
     /// Halves the image (2×2 average) until its long side is at most `max_side`. Scans far above
     /// 300 ppi only cost time.
     pub fn capped(mut self, max_side: usize) -> Rgb {

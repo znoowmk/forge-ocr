@@ -1,0 +1,17 @@
+[package]
+name = "forge-ocr-c"
+version = "0.1.0"
+edition = "2024"
+description = "C API for ForgeOCR (libforge_ocr + forge_ocr.h)"
+license = "Apache-2.0"
+repository = "https://github.com/znoowmk/forge-ocr"
+publish = false
+
+[lib]
+name = "forge_ocr"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+forge-ocr = { path = "../.." }
+serde_json = "1"
+anyhow = "1"

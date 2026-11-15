@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "forge-ocr"
+dynamic = ["version"]
+description = "Fast OCR for scanned documents: PP-OCRv5 on ONNX Runtime with a native Rust pipeline"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["numpy"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
