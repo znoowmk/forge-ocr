@@ -1,85 +1,137 @@
 # ForgeOCR
 
-OCR for scanned documents. It runs the PP-OCRv5 detector and recognizer (ONNX) on ONNX Runtime;
-everything around the two networks is native Rust and runs in parallel. That covers reading the
-scan out of the PDF, resizing, finding the text boxes, cutting them out, batching, CTC decoding
-and reading order.
+Fast, accurate OCR for scanned documents, in Rust.
+
+ForgeOCR runs the PP-OCRv5 detector and recognizer on ONNX Runtime (TensorRT, CUDA or CPU).
+Everything around those two networks is native Rust and runs in parallel: reading the scan out
+of the PDF, preparing the image, finding text boxes, cutting them out, batching, decoding and
+putting rows back in reading order. With TensorRT it reads about **10 pages per second** on a
+mid-range GPU. It stays accurate on poor scans, where Tesseract falls apart.
 
 ```bash
-forge-ocr --models models/ scan.pdf            # text, pages separated by \f, one printed row per line
-forge-ocr --models models/ --json scan.pdf     # every line with its score and corners
-forge-ocr --models models/ --cpu photo.jpg     # without a GPU
+forge-ocr --models models/ scan.pdf                      # text: one printed row per line, pages split by \f
+forge-ocr --models models/ --trt ~/.cache/forge-ocr scan.pdf   # TensorRT FP16 (fastest)
+forge-ocr --models models/ --json scan.pdf               # every line with its score and corners
+forge-ocr --models models/ --out-dir out/ *.pdf          # one .txt per input
+forge-ocr --models models/ --check luhn:16 receipts.pdf  # check-digit correction for 16-digit numbers
+forge-ocr --models models/ --cpu photo.jpg               # no GPU
 ```
+
+## Benchmark
+
+`bench/` makes synthetic scanned pages with known text and scores every engine against it, so
+anyone can reproduce the numbers:
+
+```bash
+python3 bench/make_pages.py /tmp/pages --pages 60            # clean scans
+python3 bench/make_pages.py /tmp/hard --pages 60 --hard      # poor scans: skew, blur, low resolution, noise, uneven light
+python3 bench/run.py /tmp/pages --engines forge-trt,forge,tesseract,rapidocr-latin,rapidocr
+```
+
+The pages are US letter at 300 dpi: Spanish prose with accents, a payroll-style table (names,
+11-digit IDs with a check digit, amounts, dates), then degraded like a scan. Results on an
+RTX 3060 12 GB with 16 CPU threads, 60 pages each:
+
+**Clean scans**
+
+| Engine | Pages/s | Words right (F1) | IDs exact |
+|---|---|---|---|
+| **ForgeOCR, TensorRT** | **9.92** | **100.0 %** | 100 % |
+| ForgeOCR, CUDA | 4.71 | 100.0 % | 100 % |
+| Tesseract 5.5 (spa+eng, 16 processes) | 7.30 | 97.5 % | 100 % |
+| RapidOCR, PP-OCRv5 Latin, CUDA (same models) | 2.65 | 96.9 % | 100 % |
+| RapidOCR, stock | 2.29 | 95.4 % | 100 % |
+
+**Poor scans** (`--hard`)
+
+| Engine | Pages/s | Words right (F1) | IDs exact |
+|---|---|---|---|
+| **ForgeOCR, TensorRT** | **9.94** | **99.2 %** | 99.8 % |
+| ForgeOCR, CUDA | 4.70 | 99.2 % | 100 % |
+| Tesseract 5.5 | 8.06 | 42.4 % | 38.1 % |
+| RapidOCR, PP-OCRv5 Latin, CUDA | 2.70 | 98.0 % | 100 % |
+| RapidOCR, stock | 2.36 | 97.4 % | 100 % |
+
+"Words right" matches words regardless of line order or how an engine splits rows. Every engine's
+output is grouped into rows the same way before scoring. On 201 real scanned pages (Mexican
+social-security and training records, not published), ForgeOCR read 4.5 pages/s on CUDA against
+2.9 for RapidOCR tuned the same way, with as many valid IDs.
 
 ## Why it is faster
 
-PP-OCR's own pipeline is Python around two neural networks. Profiled on real scans, the networks
-were a small part of the time. The rest was Python:
-- normalising the full page;
-- cutting and resizing about 150 crops a page one by one;
-- the detector's post-processing with OpenCV and pyclipper;
+Profiling PP-OCR's Python pipeline on real scans showed the two networks were a small part of
+the time. The rest was Python around them:
+- normalising the whole page;
+- cutting and resizing some 150 crops a page one by one;
+- the detector's post-processing in OpenCV and pyclipper;
 - small recognizer batches.
 
-ForgeOCR does those in Rust:
-
-| Stage (per page) | RapidOCR (Python) | ForgeOCR |
-|---|---|---|
-| Detector input (resize + normalise) | ~49 ms | 9 ms |
-| Detector post-processing (boxes) | part of 125 ms | 2 ms |
-| Crops (cut, straighten, resize) | ~40 ms | 13 ms |
-| CTC decoding | ~5 ms | 1 ms |
-
-Measured on 201 real scanned pages (16 PDFs of Mexican social-security and training records),
-RTX 3060 12 GB, 16 threads:
-
-| | Pages/s | Valid IDs read* |
-|---|---|---|
-| RapidOCR, stock settings | 1.7 | 214 |
-| RapidOCR, tuned (FP16, no orientation net, detection at 1600 px) | 2.9 | 232 |
-| **ForgeOCR 0.1** | **4.5** | **234** |
-
-\* NSS numbers whose check digit is right. The text of the two engines agrees 89–98 % per
-character.
-
-**Check-digit rules** (`--check luhn:11`). When a number of that length fails its check digit,
-ForgeOCR looks at the digits the network doubted (probability below 0.6). If changing one of them
-to the alternative it also considered (probability 0.2 or more) makes the check pass, it applies
-the most likely such change. Clear readings are never changed, so numbers that don't use the
-check stay as read. On the pages above it fixed 3 digits and added 2 valid IDs (234 → 236), one of
-which the other engine also read independently. Most failed IDs were read confidently wrong or
-are missing a digit, which this rule does not attempt.
-
-The recognizer on the GPU is now most of the time, so the next steps are TensorRT FP16 and running
-the CPU stages while the GPU works.
-
-## Design
+ForgeOCR does all of that in parallel Rust (per page: 9 ms to prepare the detector input, 2 ms
+to find boxes, 13 ms to cut crops, 1 ms to decode). It reads a scan's JPEG as stored instead of
+re-rendering it, runs the recognizer in FP16 on batches sorted by width, and with TensorRT
+compiles both networks for your GPU.
 
 ```
 PDF page ─► embedded JPEG decoded as stored, or rendered (pdftoppm)
-         ─► detector input: resize so the long side ≤ 1600, sides multiples of 32,
-            normalise; parallel over rows
-         ─► DB detector (ONNX Runtime, CUDA) ─► probability map
+         ─► detector input: long side ≤ 1600, sides multiples of 32, normalised (parallel)
+         ─► DB detector ─► probability map
          ─► boxes: threshold, 2×2 dilation, 8-connected components, convex hull,
             minimum-area rectangle, mean score, unclip (grow by area×1.6/perimeter)
-         ─► crops: each box sampled straight from the full page to 48 px high
-            (one bilinear pass)
-         ─► recognizer: crops of a chunk of pages sorted by shape, batches
-            padded to multiples of 64 px, FP16
-         ─► CTC (greedy, keeps each character's probability) ─► rows by position
+         ─► crops: each box sampled straight from the full page to 48 px high (one bilinear pass)
+         ─► recognizer: crops sorted by shape, batches padded to multiples of 64 px, FP16
+         ─► CTC (greedy, keeping each character's probability)
+         ─► optional check-digit correction ─► rows by position
 ```
 
-## Models
+**Check-digit correction** (`--check luhn:N`). When a number of N digits fails its check digit,
+ForgeOCR looks at the digits the network doubted (probability below 0.6). If changing one of
+them to the alternative it also considered (0.2 or more) makes the check pass, it applies the
+most likely such change. Clear readings are never changed. On the real pages above it fixed 3
+digits (valid IDs 234 → 236). Most wrong IDs there were read confidently wrong or missed a digit,
+which this rule does not try to fix.
 
-PP-OCRv5 mobile detector and the Latin recognizer, from PaddleOCR (Apache-2.0), as ONNX. Put them
-in the models folder as `det.onnx` and `rec.onnx`, or under their original names. An FP16 copy of
-the recognizer is picked up when present (`latin_PP-OCRv5_rec_mobile_fp16.onnx`).
+## Install
 
-## Running it
+1. **ONNX Runtime 1.31 or newer.** The simplest source is the Python wheel: `pip install
+   "onnxruntime-gpu[cuda,cudnn]"` (or `onnxruntime` for CPU only). Point `ORT_DYLIB_PATH` to its
+   `libonnxruntime.so`. For the GPU, put the wheel's `capi/` folder and the `nvidia/*/lib`
+   folders on `LD_LIBRARY_PATH`. For TensorRT, also `pip install tensorrt-cu13-libs==10.*` and add
+   its `tensorrt_libs` folder.
+2. **Models:** `scripts/fetch-models.sh models`. It downloads and checks the PP-OCRv5 detector
+   and Latin recognizer. Optionally run `python3 scripts/fp16.py models` for the FP16 recognizer
+   used on CUDA.
+3. **Build:** `cargo build --release`. The binary is `target/release/forge-ocr`. PDFs whose pages
+   aren't a single scan need `pdftoppm` (poppler) to render them.
 
-ForgeOCR loads ONNX Runtime at start. Point `ORT_DYLIB_PATH` to `libonnxruntime` (1.31 or
-newer). For the GPU, ONNX Runtime's CUDA provider and the CUDA and cuDNN libraries must be on the
-library path.
+The first `--trt` run builds TensorRT engines for your GPU (about 10 minutes). They are cached in
+the folder you give and reused afterwards.
+
+## As a library
+
+```rust
+let mut cfg = forge_ocr::Config::from_dir("models")?;
+cfg.trt_cache = Some("/var/cache/forge-ocr".into());
+let engine = forge_ocr::Engine::new(cfg)?;
+for page in engine.read_pdf("scan.pdf".as_ref())? {
+    println!("{}", page.text());
+    for line in &page.lines {
+        println!("{:.2} {:?} {}", line.score, line.quad, line.text);
+    }
+}
+```
+
+## Roadmap
+
+- Overlap the CPU stages with the GPU (the GPU waits while pages are prepared).
+- Prebuilt binaries with ONNX Runtime bundled, and Python bindings.
+- Layout: columns and tables as structure, not only rows.
+- More languages: PP-OCRv5 recognizers exist for other scripts.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributors accept the [CLA](CLA.md) once.
 
 ## License
 
-Apache-2.0 (see `LICENSE` and `NOTICE`). The PP-OCRv5 models are PaddleOCR's, also Apache-2.0.
+Apache-2.0 (see `LICENSE` and `NOTICE`), © Znoow. The PP-OCRv5 models are PaddleOCR's, also
+Apache-2.0, and are downloaded separately.

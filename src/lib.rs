@@ -44,6 +44,9 @@ pub struct Config {
     pub chunk: usize,
     /// Check-digit rules for digit runs (see [`ctc::fix_check_digits`]); empty = off.
     pub digit_checks: Vec<ctc::DigitCheck>,
+    /// Run the networks with TensorRT (FP16), keeping the built engines in this folder. The first
+    /// run builds them (minutes); later runs load them. Falls back to CUDA, then the CPU.
+    pub trt_cache: Option<PathBuf>,
 }
 
 impl Config {
@@ -55,7 +58,7 @@ impl Config {
         let det = pick(&["det.onnx", "ch_PP-OCRv5_det_mobile.onnx"]).ok_or_else(|| anyhow!("no detector model in {}", d.display()))?;
         let rec = pick(&["rec.onnx", "latin_PP-OCRv5_rec_mobile_fp16.onnx", "latin_PP-OCRv5_rec_mobile.onnx"])
             .ok_or_else(|| anyhow!("no recognizer model in {}", d.display()))?;
-        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), gpu: true, chunk: 8, digit_checks: Vec::new() })
+        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), gpu: true, chunk: 8, digit_checks: Vec::new(), trt_cache: None })
     }
 }
 
@@ -144,10 +147,41 @@ pub struct Engine {
     pub timings: Mutex<Timings>,
 }
 
-fn session(env: &ort::environment::Environment, path: &Path) -> Result<Session> {
-    Session::builder(env)
-        .map_err(|e| anyhow!("{e}"))?
-        .commit_from_file(path)
+/// TensorRT input-shape ranges: (min, opt, max) for the input `x`.
+type Profile = (&'static str, &'static str, &'static str);
+const DET_PROFILE: Profile = ("x:1x3x32x32", "x:1x3x1600x1248", "x:1x3x1600x1600");
+const REC_PROFILE: Profile = ("x:1x3x48x64", "x:32x3x48x640", "x:32x3x48x3072");
+
+fn cuda() -> ort::ep::ExecutionProviderDispatch {
+    // Heuristic cuDNN algorithm choice: exhaustive search re-benchmarks every new input shape,
+    // and line crops come in many widths.
+    ort::ep::CUDA::default().with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic).build()
+}
+
+fn session(env: &ort::environment::Environment, path: &Path, cfg: &Config, profile: Profile) -> Result<Session> {
+    let mut b = Session::builder(env).map_err(|e| anyhow!("{e}"))?;
+    if cfg.gpu {
+        let mut eps = Vec::new();
+        if let Some(cache) = &cfg.trt_cache {
+            std::fs::create_dir_all(cache)?;
+            let dir = cache.to_string_lossy().into_owned();
+            eps.push(
+                ort::ep::TensorRT::default()
+                    .with_fp16(true)
+                    .with_engine_cache(true)
+                    .with_engine_cache_path(&dir)
+                    .with_timing_cache(true)
+                    .with_timing_cache_path(&dir)
+                    .with_profile_min_shapes(profile.0)
+                    .with_profile_opt_shapes(profile.1)
+                    .with_profile_max_shapes(profile.2)
+                    .build(),
+            );
+        }
+        eps.push(cuda());
+        b = b.with_execution_providers(eps).map_err(|e| anyhow!("{e}"))?;
+    }
+    b.commit_from_file(path)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading {}", path.display()))
 }
@@ -158,17 +192,11 @@ fn ms(t: Instant) -> f64 {
 
 impl Engine {
     pub fn new(cfg: Config) -> Result<Engine> {
-        // One ONNX Runtime environment per process; with `gpu`, sessions run on CUDA (ONNX Runtime
-        // falls back to the CPU when CUDA is not available).
-        let mut builder = ort::init();
-        if cfg.gpu {
-            // Heuristic cuDNN algorithm choice: exhaustive search re-benchmarks every new input
-            // shape, and line crops come in many widths.
-            builder = builder.with_execution_providers([ort::ep::CUDA::default().with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic).build()]);
-        }
-        let env = builder.build().map_err(|e| anyhow!("{e}"))?;
-        let det = session(&env, &cfg.det_model)?;
-        let rec = session(&env, &cfg.rec_model)?;
+        // One ONNX Runtime environment per process. With `gpu`, each session tries TensorRT (when
+        // asked), then CUDA; ONNX Runtime falls back to the CPU when neither is available.
+        let env = ort::init().build().map_err(|e| anyhow!("{e}"))?;
+        let det = session(&env, &cfg.det_model, &cfg, DET_PROFILE)?;
+        let rec = session(&env, &cfg.rec_model, &cfg, REC_PROFILE)?;
         let chars = rec.metadata().map_err(|e| anyhow!("{e}"))?.custom("character").ok_or_else(|| anyhow!("the recognizer has no `character` metadata"))?;
         let charset = ctc::charset_from_metadata(&chars);
         let digit_class = ctc::digit_classes(&charset);

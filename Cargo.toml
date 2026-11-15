@@ -10,7 +10,7 @@ keywords = ["ocr", "pdf", "onnx", "text-recognition"]
 categories = ["computer-vision", "command-line-utilities"]
 
 [dependencies]
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "cuda", "std"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "cuda", "tensorrt", "std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "bmp", "webp", "pnm"] }
 lopdf = "0.47"
 rayon = "1.10"

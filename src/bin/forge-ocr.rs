@@ -20,10 +20,12 @@ fn main() -> Result<()> {
     let mut files = Vec::new();
     let mut checks: Vec<String> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
+    let mut trt: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--models" => models = args.next().map(PathBuf::from).unwrap_or(models),
             "--cpu" => cpu = true,
+            "--trt" => trt = args.next().map(PathBuf::from),
             "--json" => json = true,
             // One <stem>.txt (or .json) per input file in DIR, instead of stdout.
             "--out-dir" => out_dir = args.next().map(PathBuf::from),
@@ -32,7 +34,7 @@ fn main() -> Result<()> {
             // Check-digit rules: `luhn:11` (Mexico's NSS), `luhn:16` (cards)... repeatable.
             "--check" => checks.push(args.next().unwrap_or_default()),
             "-h" | "--help" => {
-                println!("forge-ocr [--models DIR] [--cpu] [--json] [--det-side N] [--batch N] [--check luhn:LEN]... [--out-dir DIR] FILE...");
+                println!("forge-ocr [--models DIR] [--cpu] [--json] [--det-side N] [--batch N] [--check luhn:LEN]... [--out-dir DIR] [--trt CACHE_DIR] FILE...");
                 return Ok(());
             }
             "--version" => {
@@ -47,6 +49,7 @@ fn main() -> Result<()> {
     }
     let mut cfg = Config::from_dir(&models)?;
     cfg.gpu = !cpu;
+    cfg.trt_cache = trt;
     if let Some(s) = det_side {
         cfg.det_side = s;
     }
