@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Fast OCR for scanned documents: PP-OCR models on ONNX Runtime with a native Rust pipeline"
 readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/znoowmk/forge-ocr"
 keywords = ["ocr", "pdf", "onnx", "text-recognition"]
 categories = ["computer-vision", "command-line-utilities"]
 

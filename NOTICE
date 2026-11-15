@@ -1,0 +1,8 @@
+ForgeOCR
+Copyright 2026 Znoow
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It runs models from PaddleOCR (PP-OCRv5 detector and Latin recognizer),
+Copyright PaddlePaddle Authors, licensed under the Apache License, Version 2.0.
+The models are not part of this repository.

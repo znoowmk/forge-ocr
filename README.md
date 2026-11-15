@@ -79,3 +79,7 @@ the recognizer is picked up when present (`latin_PP-OCRv5_rec_mobile_fp16.onnx`)
 ForgeOCR loads ONNX Runtime at start. Point `ORT_DYLIB_PATH` to `libonnxruntime` (1.31 or
 newer). For the GPU, ONNX Runtime's CUDA provider and the CUDA and cuDNN libraries must be on the
 library path.
+
+## License
+
+Apache-2.0 (see `LICENSE` and `NOTICE`). The PP-OCRv5 models are PaddleOCR's, also Apache-2.0.
