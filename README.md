@@ -41,6 +41,14 @@ RTX 3060 12 GB, 16 threads:
 \* NSS numbers whose check digit is right. The text of the two engines agrees 89–98 % per
 character.
 
+**Check-digit rules** (`--check luhn:11`). When a number of that length fails its check digit,
+ForgeOCR looks at the digits the network doubted (probability below 0.6). If changing one of them
+to the alternative it also considered (probability 0.2 or more) makes the check pass, it applies
+the most likely such change. Clear readings are never changed, so numbers that don't use the
+check stay as read. On the pages above it fixed 3 digits and added 2 valid IDs (234 → 236), one of
+which the other engine also read independently. Most failed IDs were read confidently wrong or
+are missing a digit, which this rule does not attempt.
+
 The recognizer on the GPU is now most of the time, so the next steps are TensorRT FP16 and running
 the CPU stages while the GPU works.
 

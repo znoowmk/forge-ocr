@@ -42,6 +42,8 @@ pub struct Config {
     pub gpu: bool,
     /// Pages prepared and recognised together (bigger = fuller GPU batches).
     pub chunk: usize,
+    /// Check-digit rules for digit runs (see [`ctc::fix_check_digits`]); empty = off.
+    pub digit_checks: Vec<ctc::DigitCheck>,
 }
 
 impl Config {
@@ -53,7 +55,7 @@ impl Config {
         let det = pick(&["det.onnx", "ch_PP-OCRv5_det_mobile.onnx"]).ok_or_else(|| anyhow!("no detector model in {}", d.display()))?;
         let rec = pick(&["rec.onnx", "latin_PP-OCRv5_rec_mobile_fp16.onnx", "latin_PP-OCRv5_rec_mobile.onnx"])
             .ok_or_else(|| anyhow!("no recognizer model in {}", d.display()))?;
-        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), gpu: true, chunk: 8 })
+        Ok(Config { det_model: det, rec_model: rec, det_side: 1600, rec_batch: 32, min_score: 0.5, db: DbParams::default(), gpu: true, chunk: 8, digit_checks: Vec::new() })
     }
 }
 
@@ -128,6 +130,8 @@ pub struct Timings {
     pub crop_ms: f64,
     pub rec_run_ms: f64,
     pub ctc_ms: f64,
+    /// Digits changed by check-digit rules.
+    pub digits_fixed: usize,
 }
 
 pub struct Engine {
@@ -135,6 +139,7 @@ pub struct Engine {
     det: Mutex<Session>,
     rec: Mutex<Session>,
     charset: Vec<String>,
+    digit_class: Option<[usize; 10]>,
     cfg: Config,
     pub timings: Mutex<Timings>,
 }
@@ -166,7 +171,8 @@ impl Engine {
         let rec = session(&env, &cfg.rec_model)?;
         let chars = rec.metadata().map_err(|e| anyhow!("{e}"))?.custom("character").ok_or_else(|| anyhow!("the recognizer has no `character` metadata"))?;
         let charset = ctc::charset_from_metadata(&chars);
-        Ok(Engine { _env: env, det: Mutex::new(det), rec: Mutex::new(rec), charset, cfg, timings: Mutex::new(Timings::default()) })
+        let digit_class = ctc::digit_classes(&charset);
+        Ok(Engine { _env: env, det: Mutex::new(det), rec: Mutex::new(rec), charset, digit_class, cfg, timings: Mutex::new(Timings::default()) })
     }
 
     pub fn config(&self) -> &Config {
@@ -240,7 +246,7 @@ impl Engine {
         let crop_ms = ms(t);
         // 5. Recognizer in batches; 6. CTC in parallel.
         let mut results: Vec<Vec<Option<ctc::Decoded>>> = boxes.iter().map(|b| vec![None; b.len()]).collect();
-        let (mut rec_run, mut ctc_ms) = (0.0, 0.0);
+        let (mut rec_run, mut ctc_ms, mut digits_fixed) = (0.0, 0.0, 0);
         for batch in crops.chunks(cfg.rec_batch.max(1)) {
             let max_ratio = batch.iter().map(|c| c.2.ratio).fold(320.0 / 48.0, f32::max);
             // Widths rounded up to 64 so batches repeat a few tensor shapes.
@@ -266,9 +272,23 @@ impl Engine {
             rec_run += ms(t);
             let t = Instant::now();
             let (tt, cc) = (shape[1] as usize, shape[2] as usize);
-            let decoded: Vec<ctc::Decoded> = (0..n).into_par_iter().map(|i| ctc::greedy(&probs[i * tt * cc..(i + 1) * tt * cc], tt, cc, &self.charset)).collect();
-            for ((pi, bi, _), d) in batch.iter().zip(decoded) {
+            let decoded: Vec<(ctc::Decoded, usize)> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let p = &probs[i * tt * cc..(i + 1) * tt * cc];
+                    let mut d = ctc::greedy(p, tt, cc, &self.charset);
+                    let mut fixed = 0;
+                    if let Some(classes) = &self.digit_class {
+                        for rule in &cfg.digit_checks {
+                            fixed += ctc::fix_check_digits(&mut d, p, cc, classes, *rule);
+                        }
+                    }
+                    (d, fixed)
+                })
+                .collect();
+            for ((pi, bi, _), (d, fixed)) in batch.iter().zip(decoded) {
                 results[*pi][*bi] = Some(d);
+                digits_fixed += fixed;
             }
             ctc_ms += ms(t);
         }
@@ -295,6 +315,7 @@ impl Engine {
         tm.crop_ms += crop_ms;
         tm.rec_run_ms += rec_run;
         tm.ctc_ms += ctc_ms;
+        tm.digits_fixed += digits_fixed;
         Ok(pages)
     }
 }

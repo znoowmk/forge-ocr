@@ -18,15 +18,21 @@ fn main() -> Result<()> {
     let mut models = std::env::var_os("FORGE_OCR_MODELS").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("models"));
     let (mut cpu, mut json, mut det_side, mut batch) = (false, false, None, None);
     let mut files = Vec::new();
+    let mut checks: Vec<String> = Vec::new();
+    let mut out_dir: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--models" => models = args.next().map(PathBuf::from).unwrap_or(models),
             "--cpu" => cpu = true,
             "--json" => json = true,
+            // One <stem>.txt (or .json) per input file in DIR, instead of stdout.
+            "--out-dir" => out_dir = args.next().map(PathBuf::from),
             "--det-side" => det_side = args.next().and_then(|v| v.parse().ok()),
             "--batch" => batch = args.next().and_then(|v| v.parse().ok()),
+            // Check-digit rules: `luhn:11` (Mexico's NSS), `luhn:16` (cards)... repeatable.
+            "--check" => checks.push(args.next().unwrap_or_default()),
             "-h" | "--help" => {
-                println!("forge-ocr [--models DIR] [--cpu] [--json] [--det-side N] [--batch N] FILE...");
+                println!("forge-ocr [--models DIR] [--cpu] [--json] [--det-side N] [--batch N] [--check luhn:LEN]... [--out-dir DIR] FILE...");
                 return Ok(());
             }
             "--version" => {
@@ -47,6 +53,12 @@ fn main() -> Result<()> {
     if let Some(b) = batch {
         cfg.rec_batch = b;
     }
+    for c in &checks {
+        match c.split_once(':') {
+            Some(("luhn", n)) => cfg.digit_checks.push(forge_ocr::ctc::DigitCheck { len: n.parse()?, check: forge_ocr::ctc::luhn_ok }),
+            _ => bail!("--check takes luhn:LENGTH, e.g. luhn:11"),
+        }
+    }
     let t0 = Instant::now();
     let engine = Engine::new(cfg)?;
     let load = t0.elapsed().as_secs_f64();
@@ -57,13 +69,24 @@ fn main() -> Result<()> {
         } else {
             engine.read_images(vec![Rgb::from_image(image::open(f)?).capped(forge_ocr::pdf::MAX_SIDE)])?
         };
-        if json {
-            println!("{}", serde_json::json!({"file": f, "pages": pages}));
+        let body = if json {
+            serde_json::json!({"file": f, "pages": pages}).to_string()
         } else {
-            let text: Vec<String> = pages.iter().map(|p| p.text()).collect();
-            print!("{}", text.join("\x0c"));
-            if files.len() > 1 {
-                print!("\x0c");
+            pages.iter().map(|p| p.text()).collect::<Vec<_>>().join("\x0c")
+        };
+        match &out_dir {
+            Some(dir) => {
+                let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let path = dir.join(format!("{stem}.{}", if json { "json" } else { "txt" }));
+                let part = path.with_extension("part");
+                std::fs::write(&part, body)?;
+                std::fs::rename(part, path)?;
+            }
+            None => {
+                print!("{body}");
+                if json || files.len() > 1 {
+                    print!("{}", if json { "\n" } else { "\x0c" });
+                }
             }
         }
     }
@@ -71,7 +94,7 @@ fn main() -> Result<()> {
     let secs = t.elapsed().as_secs_f64();
     let per = |v: f64| v / tm.pages.max(1) as f64;
     eprintln!(
-        "forge-ocr: {} pages ({} scans read as stored, {} rendered), {} lines in {:.1} s ({:.1} pages/s; models {:.1} s). Per page: decode {:.0} ms, det prep {:.0}, det {:.0}, boxes {:.0}, crops {:.0}, rec {:.0}, ctc {:.0}",
+        "forge-ocr: {} pages ({} scans read as stored, {} rendered), {} lines in {:.1} s ({:.1} pages/s; models {:.1} s). Per page: decode {:.0} ms, det prep {:.0}, det {:.0}, boxes {:.0}, crops {:.0}, rec {:.0}, ctc {:.0}. Digits fixed by check rules: {}",
         tm.pages,
         tm.pages_jpeg,
         tm.pages_rendered,
@@ -85,7 +108,8 @@ fn main() -> Result<()> {
         per(tm.det_post_ms),
         per(tm.crop_ms),
         per(tm.rec_run_ms),
-        per(tm.ctc_ms)
+        per(tm.ctc_ms),
+        tm.digits_fixed
     );
     Ok(())
 }
